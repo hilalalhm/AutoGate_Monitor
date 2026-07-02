@@ -34,6 +34,8 @@ int lightThreshold = 500;
 long duration1, duration2;
 int distance1, distance2;
 
+bool gateOpened = false;
+
 void setup() {
   Serial.begin(115200);
   delay(10);
@@ -94,12 +96,26 @@ void loop() {
   distance2 = readUltrasonic(trigPin2, echoPin2);
 
   // 4. Logika Palang Pintu Otomatis (Gerakan Cepat 0 atau 90 derajat)
-  if ((distance1 > 0 && distance1 <= 50) || 
-      (distance2 > 0 && distance2 <= 50)) 
-  {
-    gateServo.write(90); // Palang Terbuka Cepat ke 90 derajat
-  } else {
-    gateServo.write(0);  // Palang Tertutup Cepat ke 0 derajat
+  bool sensor1Detected = distance1 > 0 && distance1 <= 50;
+  bool sensor2Detected = distance2 > 0 && distance2 <= 50;
+
+  // Keluar: Sensor 2 boleh membuka palang langsung dari kondisi idle
+  if (!gateOpened && sensor2Detected) {
+    gateOpened = true;
+    gateServo.write(90);
+  }
+
+  if (gateOpened) {
+
+    if (sensor1Detected || sensor2Detected) {
+
+      gateServo.write(90);
+
+    } else {
+
+      gateServo.write(0);
+      gateOpened = false;
+    }
   }
 
   delay(100); // Jeda pembacaan loop
@@ -112,13 +128,17 @@ void loop() {
 
     // Jika menerima perintah IP_ESP/OPEN
     if (req.indexOf("/OPEN") != -1) {
+      gateOpened = true;
       gateServo.write(90);
+
       client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
       client.print("Gate Opened");
     } 
     // Jika menerima perintah IP_ESP/CLOSE
     else if (req.indexOf("/CLOSE") != -1) {
+      gateOpened = false;
       gateServo.write(0);
+
       client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
       client.print("Gate Closed");
     }

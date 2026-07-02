@@ -31,6 +31,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlinx.coroutines.tasks.await
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -58,6 +66,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
+import androidx.compose.ui.layout.ContentScale
 
 // --- MANAJEMEN KONEKSI ---
 object WifiNetworkManager {
@@ -215,6 +224,106 @@ suspend fun fetchSensorData(url: String): Triple<Float, Float, Float>? {
     }
 }
 
+suspend fun fetchCameraImage(url: String): ByteArray? {
+    return suspendCancellableCoroutine { cont ->
+        try {
+            val request = Request.Builder()
+                .url(url)
+                .header("Connection", "close")
+                .build()
+
+            val call = getHttpClient().newCall(request)
+
+            cont.invokeOnCancellation {
+                try {
+                    call.cancel()
+                } catch (_: Exception) {
+                }
+            }
+
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resume(null)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    response.use {
+                        if (!response.isSuccessful) {
+                            if (cont.isActive) cont.resume(null)
+                            return
+                        }
+
+                        if (cont.isActive) {
+                            cont.resume(it.body?.bytes())
+                        }
+                    }
+                }
+            })
+        } catch (_: Exception) {
+            if (cont.isActive) cont.resume(null)
+        }
+    }
+}
+
+suspend fun sendOpenGate(): Boolean {
+    return suspendCancellableCoroutine { cont ->
+
+        try {
+
+            val request = Request.Builder()
+                .url("http://192.168.10.10/OPEN")
+                .header("Connection", "close")
+                .build()
+
+            val call = getHttpClient().newCall(request)
+
+            cont.invokeOnCancellation {
+                call.cancel()
+            }
+
+            call.enqueue(object : Callback {
+
+                override fun onFailure(call: Call, e: IOException) {
+                    if (cont.isActive) cont.resume(false)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    response.use {
+                        if (cont.isActive) {
+                            cont.resume(it.isSuccessful)
+                        }
+                    }
+                }
+            })
+
+        } catch (_: Exception) {
+            if (cont.isActive) cont.resume(false)
+        }
+    }
+}
+
+suspend fun recognizeText(bitmap: Bitmap): String {
+
+    val recognizer = TextRecognition.getClient(
+        TextRecognizerOptions.DEFAULT_OPTIONS
+    )
+
+    val image = InputImage.fromBitmap(bitmap, 0)
+
+    return try {
+        recognizer.process(image).await().text
+    } catch (_: Exception) {
+        ""
+    }
+}
+
+private val allowedPlates = setOf(
+    "A234AZA",
+    "B1234ABC",
+    "D5678XYZ",
+    "H2123YH"
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -263,7 +372,8 @@ fun AppNavigation(viewModel: HistoryViewModel) {
     NavHost(navController = navController, startDestination = "First") {
         composable("First") { FirstScreen(navController) }
         composable("Second") { SecondScreen(navController, viewModel) }
-        composable( "Sensor") { SensorScreen(viewModel) }
+        composable("Sensor") { SensorScreen(viewModel) }
+        composable("Camera") { CameraScreen() }
     }
 }
 
@@ -294,16 +404,62 @@ fun FirstScreen(navController: NavController) {
 fun SecondScreen(navController : NavController, viewModel: HistoryViewModel) {
     val context = LocalContext.current
     val logs by viewModel.logs.collectAsState()
+    var isProcessingScan by remember { mutableStateOf(false) }
+    var hasScannedCurrentVehicle by remember { mutableStateOf(false) }    
     
     LaunchedEffect(Unit) {
-        val url = "http://192.168.4.1" 
+        val url = "http://192.168.10.10"
+
         while (true) {
             try {
                 val data = fetchSensorData(url)
+
                 if (data != null) {
-                    viewModel.updateDataAndCheckNotification(context, data.first, data.second, data.third)
+                    viewModel.updateDataAndCheckNotification(
+                        context,
+                        data.first,
+                        data.second,
+                        data.third
+                    )
+
+                    val sensorInDetected = data.first > 0 && data.first <= 50
+
+                    if (!sensorInDetected) {
+                        hasScannedCurrentVehicle = false
+                    }
+
+                    if (sensorInDetected && !isProcessingScan && !hasScannedCurrentVehicle) {
+                        isProcessingScan = true
+
+                        val imageBytes = fetchCameraImage("http://192.168.10.20/capture")
+                        val bitmap = imageBytes?.let {
+                            BitmapFactory.decodeByteArray(it, 0, it.size)
+                        }
+
+                        val scanText = bitmap?.let {
+                            recognizeText(it)
+                        }.orEmpty()
+
+                        val normalizedPlate = scanText
+                            .uppercase()
+                            .replace(" ", "")
+
+                        if (normalizedPlate.isNotBlank()) {
+                            viewModel.addLog("Plat Terdeteksi: $normalizedPlate")
+                        }
+
+                        if (allowedPlates.contains(normalizedPlate)) {
+                            sendOpenGate()
+                        }
+
+                        hasScannedCurrentVehicle = true
+                        isProcessingScan = false
+                    }
                 }
-            } catch (_: Exception) { }
+            } catch (_: Exception) {
+                isProcessingScan = false
+            }
+
             delay(1000)
         }
     }
@@ -313,8 +469,25 @@ fun SecondScreen(navController : NavController, viewModel: HistoryViewModel) {
         Spacer(modifier = Modifier.height(20.dp))
         Text(text = "Monitoring Sensor", fontSize = 18.sp, fontWeight = FontWeight.Medium)
         Spacer(modifier = Modifier.height(10.dp))
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-            Button(onClick = { navController.navigate("Sensor") }) { Text("Monitor & Notifikasi") }
+        Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Button(
+                onClick = {
+                    navController.navigate("Sensor")
+                }
+            ) {
+                Text("Monitor & Notifikasi")
+            }
+
+            Button(
+                onClick = {
+                    navController.navigate("Camera")
+                }
+            ) {
+                Text("Lihat Kamera")
+            }
         }
         Spacer(modifier = Modifier.height(20.dp))
         Text(text = "Status Terkini", fontSize = 18.sp, fontWeight = FontWeight.Medium)
@@ -353,7 +526,7 @@ fun SensorScreen(viewModel: HistoryViewModel) {
             launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         
-        val url = "http://192.168.4.1" 
+        val url = "http://192.168.10.10" 
         
         while (true) {
             try {
@@ -380,9 +553,21 @@ fun SensorScreen(viewModel: HistoryViewModel) {
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        Box(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 40.dp, start = 16.dp, end = 16.dp).background(if (statusColor == Color.Red) Color(0xFFFFEBEE) else Color.Transparent), contentAlignment = Alignment.Center) {
-            Text(text = status, color = statusColor, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(top = 40.dp, bottom = 40.dp, start = 16.dp, end = 16.dp)
+                .background(if (statusColor == Color.Red) Color(0xFFFFEBEE) else Color.Transparent),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = status,
+                color = statusColor,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
+            )
         }
+
         Box(modifier = Modifier.weight(1f).fillMaxWidth().background(Color(0xFFBBDEFB)), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Text(text = "Jarak 1 (Masuk)", fontSize = 24.sp, fontWeight = FontWeight.Bold)
@@ -404,5 +589,71 @@ fun SensorScreen(viewModel: HistoryViewModel) {
                 Text(text = String.format(Locale.US,"%.2f cm", viewModel.lastDistance2), fontSize = 48.sp, fontWeight = FontWeight.ExtraBold, color = Color(0xFF006064))
             }
         }
+    }
+}
+
+@Composable
+fun CameraScreen() {
+
+    var imageBytes by remember {
+        mutableStateOf<ByteArray?>(null)
+    }
+
+    var recognizedText by remember {
+        mutableStateOf("")
+    }
+
+    LaunchedEffect(Unit) {
+
+        imageBytes = fetchCameraImage(
+            "http://192.168.10.20/capture"
+        )
+
+        imageBytes?.let {
+
+            val bitmap = BitmapFactory.decodeByteArray(
+                it,
+                0,
+                it.size
+            )
+
+            recognizedText = recognizeText(bitmap)
+        }
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+
+        imageBytes?.let {
+
+            val bitmap = BitmapFactory.decodeByteArray(
+                it,
+                0,
+                it.size
+            )
+
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "ESP32 Camera",
+                    modifier = Modifier.fillMaxWidth(),
+                    contentScale = ContentScale.Fit
+                )
+
+                Spacer(modifier = Modifier.height(16.dp))
+
+                Text(
+                    text = recognizedText.ifBlank {
+                        "Belum ada teks"
+                    }
+                )
+            }
+
+        } ?: Text("Mengambil gambar...")
     }
 }

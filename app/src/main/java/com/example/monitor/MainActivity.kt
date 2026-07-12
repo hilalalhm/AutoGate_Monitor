@@ -23,6 +23,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
@@ -54,6 +55,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -69,6 +71,8 @@ import kotlin.coroutines.resume
 import androidx.compose.ui.layout.ContentScale
 
 // --- MANAJEMEN KONEKSI ---
+private const val ESP32_BASE_URL = "http://192.168.10.10"
+
 object WifiNetworkManager {
     @Volatile var network: Network? = null
 }
@@ -104,7 +108,10 @@ class HistoryViewModel : ViewModel() {
     var lastDistance2 by mutableFloatStateOf(0f)
     var lastLdr by mutableFloatStateOf(0f)
 
-    private var isGateOpen by mutableStateOf(false)
+    var isGateOpen by mutableStateOf(false)
+        private set
+    var isManualMode by mutableStateOf(false)
+        private set
 
     fun addLog(message: String) {
         val currentTime = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
@@ -130,28 +137,27 @@ class HistoryViewModel : ViewModel() {
         lastStatusTime = "-"
     }
     
-    fun updateDataAndCheckNotification(
-        context: Context, 
-        d1: Float, 
-        d2: Float, 
-        ldr: Float
-    ) {
-        lastDistance1 = d1
-        lastDistance2 = d2
-        lastLdr = ldr
-        
-        val sensorDetectsObject = (d1 > 0 && d1 <= 50) || (d2 > 0 && d2 <= 50)
-        
-        if (sensorDetectsObject && !isGateOpen) {
-            val msg = "Palang Terbuka (Otomatis)"
+    fun updateDataAndCheckNotification(context: Context, data: GateSensorData) {
+        lastDistance1 = data.distance1
+        lastDistance2 = data.distance2
+        lastLdr = data.ldr
+        isManualMode = data.manualMode
+
+        if (data.gateOpen && !isGateOpen) {
+            val msg = if (data.manualMode) "Palang Terbuka (Manual)" else "Palang Terbuka (Otomatis)"
             addLog(msg)
             NotificationHelper.showNotification(context, "Sistem Palang Pintu", msg)
-            isGateOpen = true
-        } else if (!sensorDetectsObject && isGateOpen) {
-            val msg = "Palang Tertutup (Otomatis)"
+        } else if (!data.gateOpen && isGateOpen) {
+            val msg = if (data.manualMode) "Palang Tertutup (Manual)" else "Palang Tertutup (Otomatis)"
             addLog(msg)
-            isGateOpen = false
         }
+
+        isGateOpen = data.gateOpen
+    }
+
+    fun logManualCommand(success: Boolean, opening: Boolean) {
+        val action = if (opening) "Buka" else "Tutup"
+        addLog(if (success) "Perintah $action Manual Terkirim" else "Gagal Kirim Perintah $action Manual")
     }
 }
 
@@ -190,7 +196,16 @@ object NotificationHelper {
 }
 
 // --- FUNGSI FETCH DATA ---
-suspend fun fetchSensorData(url: String): Triple<Float, Float, Float>? {
+// --- FUNGSI FETCH DATA ---
+data class GateSensorData(
+    val distance1: Float,
+    val distance2: Float,
+    val ldr: Float,
+    val gateOpen: Boolean,
+    val manualMode: Boolean
+)
+
+suspend fun fetchSensorData(url: String): GateSensorData? {
     return suspendCancellableCoroutine { cont ->
         try {
             val request = Request.Builder().url(url).header("Connection", "close").build()
@@ -211,10 +226,14 @@ suspend fun fetchSensorData(url: String): Triple<Float, Float, Float>? {
                             val body = it.body?.string() ?: ""
                             try {
                                 val json = JSONObject(body)
-                                val sensor1 = json.optDouble("sensor1", 0.0).toFloat()
-                                val sensor2 = json.optDouble("sensor2", 0.0).toFloat()
-                                val ldr = json.optDouble("ldr", 0.0).toFloat()
-                                if (cont.isActive) cont.resume(Triple(sensor1, sensor2, ldr))
+                                val data = GateSensorData(
+                                    distance1 = json.optDouble("sensor1", 0.0).toFloat(),
+                                    distance2 = json.optDouble("sensor2", 0.0).toFloat(),
+                                    ldr = json.optDouble("ldr", 0.0).toFloat(),
+                                    gateOpen = json.optBoolean("gate", false),
+                                    manualMode = json.optBoolean("manualMode", false)
+                                )
+                                if (cont.isActive) cont.resume(data)
                             } catch (_: Exception) { if (cont.isActive) cont.resume(null) }
                         }
                     } catch (_: Exception) { if (cont.isActive) cont.resume(null) }
@@ -265,13 +284,17 @@ suspend fun fetchCameraImage(url: String): ByteArray? {
     }
 }
 
-suspend fun sendOpenGate(): Boolean {
+suspend fun sendOpenGate(): Boolean = sendGateCommand("/OPEN")
+
+suspend fun sendCloseGate(): Boolean = sendGateCommand("/CLOSE")
+
+private suspend fun sendGateCommand(path: String): Boolean {
     return suspendCancellableCoroutine { cont ->
 
         try {
 
             val request = Request.Builder()
-                .url("http://192.168.10.10/OPEN")
+                .url("$ESP32_BASE_URL$path")
                 .header("Connection", "close")
                 .build()
 
@@ -401,6 +424,60 @@ fun FirstScreen(navController: NavController) {
 }
 
 @Composable
+fun ManualGateControl(viewModel: HistoryViewModel) {
+    val scope = rememberCoroutineScope()
+    var isSending by remember { mutableStateOf(false) }
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            text = if (viewModel.isManualMode) "Mode: Manual" else "Mode: Otomatis",
+            fontSize = 14.sp,
+            fontWeight = FontWeight.Medium,
+            color = if (viewModel.isManualMode) Color(0xFFEF6C00) else Color(0xFF4CAF50)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly
+        ) {
+            Button(
+                onClick = {
+                    if (!isSending) {
+                        isSending = true
+                        scope.launch {
+                            val success = sendOpenGate()
+                            viewModel.logManualCommand(success, opening = true)
+                            isSending = false
+                        }
+                    }
+                },
+                enabled = !isSending,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+            ) {
+                Text("Buka Manual")
+            }
+
+            Button(
+                onClick = {
+                    if (!isSending) {
+                        isSending = true
+                        scope.launch {
+                            val success = sendCloseGate()
+                            viewModel.logManualCommand(success, opening = false)
+                            isSending = false
+                        }
+                    }
+                },
+                enabled = !isSending,
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+            ) {
+                Text("Tutup Manual")
+            }
+        }
+    }
+}
+
+@Composable
 fun SecondScreen(navController : NavController, viewModel: HistoryViewModel) {
     val context = LocalContext.current
     val logs by viewModel.logs.collectAsState()
@@ -408,21 +485,16 @@ fun SecondScreen(navController : NavController, viewModel: HistoryViewModel) {
     var hasScannedCurrentVehicle by remember { mutableStateOf(false) }    
     
     LaunchedEffect(Unit) {
-        val url = "http://192.168.10.10"
+        val url = ESP32_BASE_URL
 
         while (true) {
             try {
                 val data = fetchSensorData(url)
 
                 if (data != null) {
-                    viewModel.updateDataAndCheckNotification(
-                        context,
-                        data.first,
-                        data.second,
-                        data.third
-                    )
+                    viewModel.updateDataAndCheckNotification(context, data)
 
-                    val sensorInDetected = data.first > 0 && data.first <= 50
+                    val sensorInDetected = data.distance1 > 0 && data.distance1 <= 50
 
                     if (!sensorInDetected) {
                         hasScannedCurrentVehicle = false
@@ -490,6 +562,8 @@ fun SecondScreen(navController : NavController, viewModel: HistoryViewModel) {
             }
         }
         Spacer(modifier = Modifier.height(20.dp))
+        ManualGateControl(viewModel = viewModel)
+        Spacer(modifier = Modifier.height(20.dp))
         Text(text = "Status Terkini", fontSize = 18.sp, fontWeight = FontWeight.Medium)
         Box(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(60.dp).background(Color(0xFFE3F2FD)), contentAlignment = Alignment.Center) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -526,13 +600,13 @@ fun SensorScreen(viewModel: HistoryViewModel) {
             launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
         
-        val url = "http://192.168.10.10" 
-        
+        val url = ESP32_BASE_URL
+
         while (true) {
             try {
                 val data = fetchSensorData(url)
                 if (data != null) {
-                    viewModel.updateDataAndCheckNotification(context, data.first, data.second, data.third)
+                    viewModel.updateDataAndCheckNotification(context, data)
                     status = "Terhubung"
                     statusColor = Color(0xFF4CAF50)
                 } else {

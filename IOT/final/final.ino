@@ -35,6 +35,9 @@ long duration1, duration2;
 int distance1, distance2;
 
 bool gateOpened = false;
+bool manualMode = false; // true jika sudah pernah dikontrol manual via /OPEN atau /CLOSE
+unsigned long lastDetectedTime = 0;
+const unsigned long holdDuration = 1000; // servo tetap terbuka 1 detik setelah objek hilang
 
 void setup() {
   Serial.begin(115200);
@@ -99,22 +102,28 @@ void loop() {
   bool sensor1Detected = distance1 > 0 && distance1 <= 50;
   bool sensor2Detected = distance2 > 0 && distance2 <= 50;
 
-  // Keluar: Sensor 2 boleh membuka palang langsung dari kondisi idle
-  if (!gateOpened && sensor2Detected) {
-    gateOpened = true;
-    gateServo.write(90);
-  }
+  // Logika sensor otomatis hanya berjalan selama belum ada override manual
+  if (!manualMode) {
 
-  if (gateOpened) {
-
-    if (sensor1Detected || sensor2Detected) {
-
+    // Keluar: Sensor 2 boleh membuka palang langsung dari kondisi idle
+    if (!gateOpened && sensor2Detected) {
+      gateOpened = true;
       gateServo.write(90);
+      lastDetectedTime = millis(); // set timer awal saat gerbang mulai terbuka
+    }
 
-    } else {
+    if (gateOpened) {
 
-      gateServo.write(0);
-      gateOpened = false;
+      if (sensor1Detected || sensor2Detected) {
+
+        gateServo.write(90);
+        lastDetectedTime = millis(); // reset timer selama masih ada objek
+
+      } else if (millis() - lastDetectedTime >= holdDuration) {
+
+        gateServo.write(0);
+        gateOpened = false;
+      }
     }
   }
 
@@ -128,14 +137,15 @@ void loop() {
 
     // Jika menerima perintah IP_ESP/OPEN
     if (req.indexOf("/OPEN") != -1) {
+      manualMode = true;   // override mutlak, sensor otomatis nonaktif
       gateOpened = true;
       gateServo.write(90);
 
       client.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n");
       client.print("Gate Opened");
     } 
-    // Jika menerima perintah IP_ESP/CLOSE
     else if (req.indexOf("/CLOSE") != -1) {
+      manualMode = false;  // kembali ke alur otomatis
       gateOpened = false;
       gateServo.write(0);
 
@@ -154,6 +164,12 @@ void loop() {
       client.print(",");
       client.print("\"ldr\":");
       client.print(ldrValue);
+      client.print(",");
+      client.print("\"gate\":");
+      client.print(gateOpened ? "true" : "false");
+      client.print(",");
+      client.print("\"manualMode\":");
+      client.print(manualMode ? "true" : "false");
       client.print("}");
     }
     else {
